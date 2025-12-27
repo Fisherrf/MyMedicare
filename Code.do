@@ -136,7 +136,7 @@ save "$data/mm_sample_descpaper_demog.dta", replace
  * POLAR Services data
 *=========================================	  
 
-	      ****************************
+	    ****************************
         * Services dataset preclean
         ****************************
 			  
@@ -197,7 +197,7 @@ compress
 save "$data/mm_services_precollapse.dta", replace		
 				
 
-	      *****************************************
+	    *****************************************
         * Obtain services descriptive information
         *****************************************
 use "$data/mm_services_precollapse.dta", clear
@@ -537,16 +537,16 @@ egen presc_total = rowtotal(presc_*)
 
 gen mm_group = .
 
-* 3. Never-enrolled = 0
+* 1. Never-enrolled = 0
 replace mm_group = 0 if treated == 0
 
-* 4. Among registrants, create tertiles of first_enrol_m
+* 2. Among registrants, create tertiles of first_enrol_m
 xtile enrol_tertile = first_enrol_m if treated == 1, n(3)
 
-* 5. Copy those tertiles into mm_group for registrants
+* 3. Copy those tertiles into mm_group for registrants
 replace mm_group = enrol_tertile if treated == 1
 
-* 6. Label the groups
+* 4. Label the groups
 label define mm_group_lab ///
     0 "Never enrolled" ///
     1 "Early enrollee" ///
@@ -564,8 +564,8 @@ save "$data/mm_analytical_sample.dta", replace
 
 			
 			
-      **********************
-      * tabulation analysis
+        **********************
+        * tabulation analysis
 	    **********************	
 			
 use "$data/mm_analytical_sample.dta", clear 
@@ -641,9 +641,9 @@ estimates store log1
 
 
 
-            *********************************
-            *        Combined coefplot
-            *********************************	
+            ********************
+            * Combined coefplot
+            ********************	
 set scheme s1mono
 graph set window fontface "Arial"
 
