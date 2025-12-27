@@ -1,0 +1,759 @@
+********************************************************************************
+********************************************************************************
+clear all
+capture log close
+set more off
+set linesize 80
+set matsize 800
+set maxvar 32767
+macro drop _all
+
+/*global data "C:/Users/fisherrf/The University of Melbourne/Karinna Saxby - polar/data" // old data directory*/
+ 
+glo data "C:\Users\fisherrf\The University of Melbourne\Karinna Saxby - polar\data\data_updated" // updated data directory september
+glo output "C:\Users\fisherrf\The University of Melbourne\Karinna Saxby - polar\output\mymedicare\final_results"
+
+********************************************************************************
+********************************************************************************
+
+** Note: the polar and abs datasets have already been imported and saved onto my onedrive from the RCBH dofile
+
+
+*=======================================================
+* POLAR patient data; extract mymedicare enrolment dates
+*=======================================================	  
+
+use "$data/patient_sept.dta", clear
+
+drop if polar_id_1 == "NULL" // 1 million rows dropped
+drop if sex == "Not Specified" | sex == "Unknown"
+drop if yob == "NULL"
+drop if post_code == "Unknown"
+
+keep polar_id_1 patientsitekey practice_id mymedicare_registration mymedicare_registration_date
+	
+* Keep people (POLAR IDs) who ever registered; i.e. all of their patientsitekeys
+g my_med = mymedicare_registration=="Registered"
+bys polar_id_1: egen mm_flag_keep = max(my_med)
+keep if mm_flag_keep==1   // keep POLARs who ever registered (keep all their sitekeys)
+
+* Monthly and quarterly first registration dates into mymedicare
+g mm_dt = clock(mymedicare_registration_date, "YMDhms")
+g mm_day = dofc(mm_dt)
+g reg_q = qofd(mm_day) if my_med ==1 // quarterly registration date
+format reg_q %tq
+bys polar_id_1: egen first_enrol_q = min(reg_q)
+format first_enrol_q %tq
+g reg_m = mofd(mm_day) if my_med ==1 // monthly registration date 
+format reg_m %tm 
+bys polar_id_1: egen first_enrol_m = min(reg_m) 
+format first_enrol_m %tm 
+
+* Get practice that patient registered into MyMedicare with (i.e. assumed MyMedicare practice)
+g reg_d = dofd(mm_day) if my_med ==1 // gen a daily reg date to filter persons first reg date only correctly (for below code)
+bys polar_id_1: egen first_enrol_d = min(reg_d)
+format first_enrol_d %td
+
+bys polar_id_1: g reg_prac = practice_id if my_med ==1 & reg_d == first_enrol_d  // the second condition necessary for first registration date only
+bys polar_id_1: egen max_reg_prac = max(reg_prac)
+
+drop reg_prac 
+rename max_reg_prac prac_reg
+
+keep patientsitekey polar_id_1 first_enrol_* prac_reg
+
+drop if first_enrol_m == tm(2025m10)
+
+order polar_id_1 patientsitekey prac_reg 
+sort polar_id_1
+save "$data/mm_patient.dta", replace
+
+/* not sure if need this code recircle back
+preserve
+keep polar_id_1 first_enrol
+duplicates drop polar_id_1, force
+save "$data/mm_polars.dta", replace
+restore
+*/
+
+*=========================================
+ * Get sample with never treated patients
+*=========================================	
+
+            **************************
+            * get never treated sample
+            ************************** 
+use "$data/patient_sept.dta", clear			
+
+drop if polar_id_1 == "NULL" // 1 million rows dropped
+drop if sex == "Not Specified" | sex == "Unknown"
+drop if yob == "NULL"
+drop if post_code == "Unknown"
+
+keep polar_id_1 patientsitekey practice_id mymedicare_registration mymedicare_registration_date
+	
+* Keep people (POLAR IDs) who NEVER registered; i.e. all of their patientsitekeys
+g my_med = mymedicare_registration=="Registered"
+bys polar_id_1: egen mm_flag_keep = max(my_med)
+keep if mm_flag_keep==0   // keep POLARs who NEVER registered (keep all their sitekeys)
+
+keep polar_id_1 patientsitekey
+order polar_id_1 patientsitekey 
+sort polar_id_1
+
+compress
+
+save "$data/mm_patient_nevertreated.dta", replace
+
+
+            **********************************
+            * append treated and never treated
+            **********************************
+			
+use "$data/mm_patient.dta", clear
+g treated =1
+append using "$data/mm_patient_nevertreated.dta"
+
+replace treated =0 if treated ==. // 4.91 million people
+
+* Drop with invalid demographics before matching 
+merge 1:1 patientsitekey using "$data/patient_sept.dta", keepusing(yob mob sex post_code)
+keep if _merge ==3
+drop _merge
+
+destring post_code, replace
+keep if inrange(post_code, 3000, 3999)
+
+save "$data/mm_sample_descpaper.dta", replace
+
+duplicates drop polar_id_1, force
+keep polar_id_1 yob mob sex post_code treated first_enrol_m
+save "$data/mm_sample_descpaper_demog.dta", replace
+
+
+	   	
+*=========================================
+ * POLAR Services data
+*=========================================	  
+
+	      ****************************
+        * Services dataset preclean
+        ****************************
+			  
+use "$data/PHN202_UoM_RCBH_Service", clear
+
+drop service_descr_trimmed service_descr_trimmed_2 service_type location_id // for easier append below
+destring practice_id, replace // for append below
+append using "$data/service_sept.dta" // append latest september service data
+keep patientsitekey service_date service_item providersitekey
+compress
+
+* Merge in mymedicare patients
+merge m:1 patientsitekey using "$data/mm_sample_descpaper.dta", keepusing(polar_id_1) // full enrolled/never enrolled sample
+keep if _merge ==3
+drop _merge
+
+drop if regexm(service_item,"[A-Za-z]")	// 49,738 rows
+
+* Destring service item
+destring service_item, gen(service_item_num) force
+br if service_item_num ==. // there are double item combinations e.g. "5028/1" 
+
+* Drop invalid service items
+drop if service_item_num ==0 // 268,740 rows; no service "0" exists? 
+
+* Split rows with double item combinations into two rows
+gen long _rowid = _n // unique row id to keep track during expansion
+gen strL _items = subinstr(trim(service_item), "/", " ", .) // Turn "5043/1/99" into space-separated words and count them
+gen byte _nitems = cond(missing(service_item), 0, wordcount(_items))
+expand _nitems 
+bysort _rowid: gen _k = _n 
+replace service_item = word(_items, _k) 
+drop _items _nitems _k _rowid
+
+drop service_item_num // regen service_item_num with the additional double-item combinations
+destring service_item, g(service_item_num) force
+drop if service_item_num ==. 
+
+keep if inrange(service_item_num, 1, 99901)
+
+* Dates 
+**do this first to save merging memory
+gen dt = clock(service_date, "YMDhms")
+gen  date_daily = dofc(dt)
+gen my = mofd(date_daily)
+format my %tm
+gen dy = dofd(date_daily)
+format dy %td
+
+drop if dy ==. // NULL service date 
+
+drop if my < ym(2022,10) | my > ym(2023,9)
+
+keep patientsitekey providersitekey service_item_num polar_id_1 my dy
+
+compress
+
+save "$data/mm_services_precollapse.dta", replace		
+				
+
+	      *****************************************
+        * Obtain services descriptive information
+        *****************************************
+use "$data/mm_services_precollapse.dta", clear
+			  
+* Number of telehealth services (any kind with general practioner)
+gen byte service_tele_pooled = inlist(service_item_num, ///
+    91790, 91800, 91801, 91802, 91920,  91890, 91891, 91900, 91910, 91920)  // general attendance + mymedicare + 92210(urgent; note: removed)
+	
+* Number of GP services
+ gen byte service_gp_pooled = inlist(service_item_num, ///
+    3, 23, 36, 44, 123,          /// general attendance in consulting rooms (Levels A–E)
+    4, 24, 37, 47, 124,          /// general attendance out of consulting rooms (Levels A–E)
+	5000, 5020, 5040, 5060, 5071,        /// after hours in consulting rooms
+    5003, 5023, 5043, 5063, 5076,        /// after hours out of consulting rooms
+    5010, 5028, 5049, 5067, 5077,        /// after hours RACF
+    90020, 90035, 90043, 90051, 90054) // RACF (standard hours; Levels A–E)	
+	
+*CDM
+// two new items replaced old >=july 2025
+// 965 = prepare CCGPMP, 967 = review CCGPMP					                         
+gen byte service_cdm_gpmp   = inlist(service_item_num, 721, 92024, 965, 92029)
+gen byte service_cdm_tca    = inlist(service_item_num, 723, 92025)
+gen byte service_cdm_review = inlist(service_item_num, 732, 92028, 967, 92030)
+g byte service_cdm_mdmp      = inlist(service_item_num, 729,92026,731,92027)
+
+* Practice nurse item 
+g service_prac_nurse_complete = inlist(service_item_num, 10997, 10983, 10987) //
+g service_prac_nurse_chronic = inlist(service_item_num, 10997, 93201, 93203) // chronic condition only
+
+* Proactive health assessments 
+g service_gp_ha = inlist(service_item_num, 701, 703, 705, 707, 715)
+g service_heart_health = inlist(service_item_num, 699)
+						  
+* Mental health plan
+gen byte service_mhp = inlist(service_item_num, 2700,2701,2712,2713,2715,2717, ///
+                              92112, 92113, 92116, 92117, 92114, 921126, 92115, 92127 )
+
+* Multidisciplinary case conferencing	
+g service_caseconf = inlist(service_item_num, 735, 739, 743, 747, 750, 758)		   
+
+* Medication review 
+g service_medreview = service_item_num ==900
+			   			   		
+* Unique number of practices
+** First condition to only relevant services as above 
+rename service_item_num dummy
+egen service_relevant = rowtotal(service_*)
+
+drop if service_relevant ==0 // 4.4 million (~36%) this is fine; they are all bulk billing items or COVID/non-GP/irrelevant items
+                             // we dont want to count practices/providers where patients obtain these services; so remove
+
+split(patientsitekey),p("-")
+
+* Unique number of practioces
+bys polar_id_1 patientsitekey1 my : g prac_num = _n==1
+
+* Unique number of providers 
+bys polar_id_1 providersitekey my : g prov_num = _n==1	
+	
+order polar_id_1 my patientsitekey // we go quarter for now; maybe circle back to monthly	
+	
+collapse (sum) service_* prac_num prov_num, by(polar_id_1 my)	
+
+merge m:1 polar_id_1 using "$data/mm_sample_descpaper_demog.dta", keepusing(yob sex post_code treated)
+keep if _merge ==3
+drop _merge
+
+destring yob, replace
+g age = 2025-yob
+
+save "$data/mm_services_monthly.dta", replace
+
+
+** Now calculate each persons total services 12 months prior to mymedicare introduction 
+use "$data/mm_services_monthly.dta", clear
+
+drop service_relevant
+
+collapse (sum) service_*, by(polar_id_1) // no date needed as its over pre-treatment window
+
+save "$data/mm_services_pre_mymed.dta", replace
+
+* Gen new sample based on having services in range (2022m10, 2023m9)
+
+keep polar_id_1
+save "$data/mm_sample_pre_mymed.dta", replace
+
+*=========================================
+ * POLAR Prescriptions 
+*=========================================
+use patientsitekey prescription_date atc_code using "$data/PHN202_UoM_RCBH_Prescription_OY", clear
+append using "$data/presc_sept.dta"
+keep patientsitekey prescription_date atc_code
+
+gen dt_td = daily(substr(prescription_date,1,10),"YMD")
+format dt_td %td
+gen my = mofd(dt_td)
+format my %tm
+drop dt_td
+
+drop if my < ym(2022,10) | my > ym(2023,9)
+
+compress
+
+* Merge in mymedicare patients 
+merge m:1 patientsitekey using "$data/mm_sample_descpaper.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge
+
+merge m:1 polar_id_1 using "$data/mm_sample_pre_mymed.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge
+
+* ATC groups
+drop if missing(atc_code) // 3 rows
+
+gen atc_letter = substr(atc_code, 1, 1)
+
+foreach L in A B C D G H J L M N P R S T V {
+    gen byte presc_atc_`L' = (atc_letter=="`L'")
+}
+
+collapse (sum) presc_atc_*, by(polar_id_1)
+
+save "$data/mm_prescriptions_pre_mymed.dta", replace
+
+			
+*=========================================
+ * POLAR REFERRALS
+*=========================================
+use "$data/phn202_uom_rcbh_referral.dta", clear
+append using "$data/referral_sept.dta"
+
+gen referral_dt_td = daily(substr(referral_date,1,10),"YMD")
+format referral_dt_td %td
+gen my = mofd(referral_dt_td)
+format my %tm
+drop referral_dt_td
+
+drop if my < ym(2022,10) | my > ym(2023,9)
+
+compress
+
+* Merge in mymedicare patients 
+merge m:1 patientsitekey using "$data/mm_sample_descpaper.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge
+
+merge m:1 polar_id_1 using "$data/mm_sample_pre_mymed.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge
+
+g referral_number =1 // for collapse
+
+drop referral_date referral_category
+
+collapse (sum) referral_*, by(polar_id_1)
+
+save "$data/mm_referrals_pre_mymed.dta", replace
+
+*=========================================
+ * POLAR DIAGNOSES
+*=========================================
+
+use "$data/diagnosis_sept_cleaned.dta", clear
+compress 
+
+merge m:1 patientsitekey using "$data/mm_sample_descpaper.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge 
+
+merge m:1 polar_id_1 using "$data/mm_sample_pre_mymed.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge
+
+keep if diag_month >=tm(2022, 1) & diag_month <= tm(2023,9)
+
+encode chronic_disease_category, g(sad)
+
+g cardio = 1 if chronic_disease_category == "Cardiovascular"
+g respiratory = 1 if chronic_disease_category == "Respiratory"
+g cancer = 1 if chronic_disease_category == "Cancer"
+g muscul = 1 if chronic_disease_category == "Musculoskeletal"
+g mental = 1 if chronic_disease_category == "Mental Health"
+g diab = 1 if chronic_disease_category == "Diabetes"
+g disability = 1 if chronic_disease_category == "Disability"
+g dementia_alzheim =1 if sad ==1
+g chronic_other = 1 if chronic_disease_category == "AoD"
+replace chronic_other = 1 if chronic_disease_category == "CKD"
+replace chronic_other = 1 if chronic_disease_category == "Oral"
+
+bys polar_id_1: egen cardio_max = max(cardio)
+bys polar_id_1: egen respiratory_max = max(respiratory)
+bys polar_id_1: egen cancer_max = max(cancer)
+bys polar_id_1: egen muscul_max = max(muscul)
+bys polar_id_1: egen mental_max = max(mental)
+bys polar_id_1: egen diab_max = max(diab)
+bys polar_id_1: egen disability_max = max(disability)
+bys polar_id_1: egen other_max = max(chronic_other)
+bys polar_id_1: egen dementia_alzheim_max = max(dementia_alzheim)
+
+foreach var of varlist *_max {
+	replace `var' = 0 if `var' ==.
+}
+
+g diag_date_cardio = diag_month if cardio==1
+g diag_date_resp = diag_month if respiratory==1
+g diag_date_cancer = diag_month if cancer==1
+g diag_date_muscul = diag_month if muscul==1
+g diag_date_mental = diag_month if mental==1
+g diag_date_diab = diag_month if diab==1
+g diag_date_disability = diag_month if disability==1
+g diag_date_dementia_alz = diag_month if dementia_alzheim==1
+
+foreach var of varlist diag_date_* {
+	bys polar_id_1: egen `var'_max = min(`var') // extends diag date across panel for each condition
+}
+
+egen chronic_eligible = rowtotal(cardio_max respiratory_max muscul_max)
+bys polar_id_1: gen chronic_dummy = chronic_eligible >0
+keep if chronic_eligible >0 // people with at least one of CVD, CRD, frailty
+
+duplicates drop polar_id_1, force
+
+drop chronic_eligible dementia_alzheim disability diab mental muscul cancer respiratory cardio sad chronic_disease_category chronic_dummy other_max chronic_other diag_date_dementia_alz diag_date_disability diag_date_diab diag_date_mental diag_date_muscul diag_date_cancer diag_date_resp diag_date_cardio
+
+format diag_date_* %tm
+
+drop diag_* patientsitekey
+
+compress
+
+save "$data/diagnosis_mmpaper.dta", replace // polar merged to diagnosis and vars defined 
+
+
+*=========================================
+* Final dataset construction
+*=========================================	
+
+use "$data/mm_sample_descpaper.dta", clear
+duplicates drop polar_id_1, force
+
+*merge in sample with services in range 2022m10, 2023m9
+merge m:1 polar_id_1 using "$data/mm_sample_pre_mymed.dta", keepusing(polar_id_1)
+keep if _merge ==3
+drop _merge
+
+* merge individual datasets
+merge 1:1 polar_id_1 using "$data/mm_services_pre_mymed.dta", nogen
+merge 1:1 polar_id_1 using "$data/mm_prescriptions_pre_mymed.dta", nogen
+merge 1:1 polar_id_1 using "$data/mm_referrals_pre_mymed.dta", nogen
+merge 1:1 polar_id_1 using"$data/diagnosis_mmpaper.dta", nogen
+
+* fill missing monthly counts with 0
+ds service_*  referral_* presc_* cardio_max respiratory_max cancer_max muscul_max mental_max diab_max disability_max dementia_alzheim_max
+foreach v of varlist `r(varlist)' {
+    replace `v' = 0 if missing(`v')
+}	
+			
+compress
+
+order polar_id_1 first_enrol_m 
+sort polar_id_1 first_enrol_m polar_id_1 
+
+save "$data/mm_final_dataset.dta", replace
+
+
+*=========================================
+ * Analysis
+*=========================================	
+
+
+            ********************************
+            * finalise descriptive variables
+            ********************************	
+			
+use  "$data/mm_final_dataset.dta", clear
+
+merge 1:1 polar_id_1 using  "$data/RCBH_ids_954.dta"
+drop if _merge ==2 // 112 RCBH patients no service between October 2022 and September 2023
+
+g flag_rcbh = (_merge ==3)
+drop _merge
+
+* Remove other/non specified sex
+keep if sex == "Female" | sex == "Male"	// 314 other/intersex just drop 
+g sex2 = (sex =="Male")
+drop sex 
+label define sex 0 "Female" 1 "Male"
+label values sex2 sex
+rename sex2 sex 
+			
+** Merge mob back in 
+merge 1:1 polar_id_1 using "$data/mm_sample_descpaper_demog.dta", keepusing(mob)
+keep if _merge ==3
+drop _merge
+
+*Age at month before mymedicare introduction (2023m9)
+destring yob, replace 
+destring mob, replace
+
+drop if yob == 2024 | yob == 2025 // 32 impossible values; everyone in sample has services <=2023m9
+
+gen dobm = ym(yob, mob)
+format dobm %tm   // just for display
+
+scalar base_m = ym(2023, 9)
+
+gen age_baseline = (base_m - dobm) / 12
+replace age_baseline = floor(age_baseline)
+
+drop if age_baseline == -1 // 6 invalid obs
+
+*Merge SEIFA in 
+merge m:1 post_code using "$data/SEIFA_irsd.dta"
+keep if _merge ==3 // 450 people dropped 
+drop _merge
+
+destring seifa_irsd, replace
+xtile seifa_med = seifa_irsd, n(2)
+replace seifa_med = 0 if seifa_med ==1
+replace seifa_med = 1 if seifa_med ==2
+label define seifa 0 "below median" 1 "above median"
+label values seifa_med seifa 
+
+*Chronic condition any 
+drop mental_max diab_max // Just drop these for this paper as mental health is not really "chronic"/low numbers and diabetes type1vs2 CBF cleaning snomed code
+egen chronic_count = rowtotal(cardio_max respiratory_max cancer_max muscul_max disability_max dementia_alzheim_max)
+g chronic_any = chronic_count >=1
+
+* Number of prescriptions 
+egen presc_total = rowtotal(presc_*)
+
+            **********************
+            * gen treatment groups
+            **********************	
+
+gen mm_group = .
+
+* 3. Never-enrolled = 0
+replace mm_group = 0 if treated == 0
+
+* 4. Among registrants, create tertiles of first_enrol_m
+xtile enrol_tertile = first_enrol_m if treated == 1, n(3)
+
+* 5. Copy those tertiles into mm_group for registrants
+replace mm_group = enrol_tertile if treated == 1
+
+* 6. Label the groups
+label define mm_group_lab ///
+    0 "Never enrolled" ///
+    1 "Early enrollee" ///
+    2 "Mid enrollee" ///
+    3 "Late enrollee"
+
+label values mm_group mm_group_lab
+
+**LOGIT binary model 
+g mm_group_binary = (treated ==1)
+				
+order polar_id_1 mm_group mm_group_binary age_baseline sex seifa_med cardio_max respiratory_max cancer_max muscul_max disability_max dementia_alzheim_max chronic_any service_tele_pooled service_gp_pooled presc_total referral_number
+
+save "$data/mm_analytical_sample.dta", replace
+
+			
+			
+      **********************
+      * tabulation analysis
+	    **********************	
+			
+use "$data/mm_analytical_sample.dta", clear 
+			
+*Mean table			
+desctable age_baseline sex seifa_med cardio_max respiratory_max cancer_max muscul_max disability_max ///
+ dementia_alzheim_max chronic_any service_tele_pooled service_gp_pooled presc_total referral_number flag_rcbh, ///
+ group(mm_group) filename("$output/descriptivesblahblah") decimals(2)	
+ 
+* For CI's get manually 
+mean age_baseline sex seifa_med chronic_any cardio_max respiratory_max muscul_max cancer_max disability_max ///
+ dementia_alzheim_max  service_tele_pooled service_gp_pooled presc_total referral_number flag_rcbh if mm_group ==0
+ 
+mean age_baseline sex seifa_med chronic_any cardio_max respiratory_max muscul_max cancer_max disability_max ///
+dementia_alzheim_max  service_tele_pooled service_gp_pooled presc_total referral_number flag_rcbh if mm_group ==1
+
+mean age_baseline sex seifa_med chronic_any cardio_max respiratory_max muscul_max cancer_max disability_max ///
+ dementia_alzheim_max  service_tele_pooled service_gp_pooled presc_total referral_number flag_rcbh if mm_group ==2
+
+mean age_baseline sex seifa_med chronic_any cardio_max respiratory_max muscul_max cancer_max  disability_max ///
+dementia_alzheim_max  service_tele_pooled service_gp_pooled presc_total referral_number flag_rcbh if mm_group ==3
+ 
+
+
+			
+            *************************
+            * multinomial logit model
+            *************************
+			
+label variable age_baseline "Age"
+label variable sex "Sex"
+label variable seifa_med "Above median socioeconomic disadvantage"
+label variable chronic_any "Chronic condition"
+label variable service_tele_pooled "GP telehealth consultations"
+label variable service_gp_pooled "GP face-to-face consultations"
+label variable presc_total "Prescription medicines"
+label variable referral_number "Referrals"
+label variable flag_rcbh "RCBH Participation"
+			
+* Multinomial logit: outcome = MyMedicare group
+* 0 (never) is the base outcome
+mlogit mm_group ///
+    c.age_baseline ///
+    i.sex ///
+    i.seifa_med ///
+    i.chronic_any ///
+    c.service_tele_pooled c.service_gp_pooled ///
+    c.presc_total c.referral_number, ///
+    baseoutcome(0) rrr 
+	
+estimates store log2
+		
+			
+            *********************************
+            * binary logit model 1 : baseline
+            *********************************	
+	
+* Ever-enrolled indicator
+label define mm_group_binary 0 "Not yet enrolled" 1 "Ever enrolled"
+label values mm_group_binary mm_group_binary
+
+label variable flag_rcbh "RCBH participation"
+
+logit mm_group_binary ///
+    c.age_baseline ///
+    i.sex ///
+    i.seifa_med ///
+    i.chronic_any ///
+    c.service_tele_pooled c.service_gp_pooled ///
+    c.presc_total c.referral_number, or
+
+estimates store log1
+
+
+
+            *********************************
+            *        Combined coefplot
+            *********************************	
+set scheme s1mono
+graph set window fontface "Arial"
+
+local KEEPVARS age_baseline 1.sex 1.seifa_med 1.chronic_any ///
+              service_tele_pooled service_gp_pooled presc_total referral_number
+
+local ORDERVARS age_baseline 1.sex 1.seifa_med 1.chronic_any ///
+               service_tele_pooled service_gp_pooled presc_total referral_number
+
+local COEFLABS ///
+    age_baseline        = "Age" ///
+    1.sex               = "Male" ///
+    1.seifa_med         = "Socioeconomic advantage" ///
+    1.chronic_any       = "Chronic condition" ///
+    service_tele_pooled = "GP telehealth consultations" ///
+    service_gp_pooled   = "GP face-to-face consultations" ///
+    presc_total         = "Prescription medicines" ///
+    referral_number     = "Referrals"
+
+* Common styling
+local GCOMMON ///
+    drop(_cons) eform ///
+    keep(`KEEPVARS') order(`ORDERVARS') ///
+    coeflabels(`COEFLABS') ///
+    xline(1, lpattern(dash) lcolor(black) lwidth(medthin)) ///
+    xlabel(0.8(0.1)1.53, labsize(small) nogrid) ///
+    ylabel(, labsize(small) angle(0) nogrid) ///
+    graphregion(color(white) margin(l=6 r=2 t=2 b=2)) ///
+    plotregion(margin(zero)) ///
+    xsize(7) ysize(3.8)
+
+	
+* Multinomial (RRR) panel
+coefplot ///
+    (log2, drop(Mid_enrollee:* Late_enrollee:*) ///
+          label("Early registrant") offset(0.12) ///
+          msymbol(O) msize(small) mcolor(black) ///
+          ciopts(recast(rcap) lwidth(thin) lcolor(black))) ///
+    (log2, drop(Early_enrollee:* Late_enrollee:*) ///
+          label("Mid registrant") offset(0) ///
+          msymbol(O) msize(small) mcolor(gs6) ///
+          ciopts(recast(rcap) lwidth(thin) lcolor(gs6))) ///
+    (log2, drop(Early_enrollee:* Mid_enrollee:*) ///
+          label("Late registrant") offset(-0.12) ///
+          msymbol(O) msize(small) mcolor(gs10) ///
+          ciopts(recast(rcap) lwidth(thin) lcolor(gs10))) ///
+    , ///
+    `GCOMMON' ///
+	yline(0.5(1)8.5, lcolor(gs12) lpattern(solid) lwidth(thin)) ///
+	grid(none) ///
+    xtitle("Relative risk ratio", size(small)) ///
+    legend( ///
+        order(2 "Early registrant" 4 "Mid registrant" 6 "Late registrant") ///
+        cols(1) size(small) pos(2) ring(0) ///
+        region(lstyle(solid) lcolor(black) lwidth(thin)) ///
+    ) ///
+    name(fig_multi, replace)
+	graph export "$output/Figure1_multinomial.tif", width(4000) replace
+
+
+* Binary (OR) panel
+coefplot ///
+    (log1, label("Ever enrolled vs never") ///
+           msymbol(O) msize(small) mcolor(black) ///
+           ciopts(recast(rcap) lwidth(thin) lcolor(black))) ///
+    , ///
+    `GCOMMON' ///
+	yline(0.5(1)8.5, lcolor(gs12) lpattern(solid) lwidth(thin)) ///
+	grid(none) ///
+    xtitle("Odds ratio", size(small)) ///
+    legend(off) ///
+    name(fig_bin, replace)
+	graph export "$output/Figure1_binary.tif", width(4000) replace
+
+
+* Combine + export
+
+graph combine fig_bin fig_multi, cols(1) ycommon ///
+    imargin(tiny) graphregion(color(white) margin(zero)) ///
+    xsize(7) ysize(7.6) name(fig_combined, replace)
+
+* Vector (best for journals)
+graph export "$output/Figure1_combined.pdf", replace
+
+* High-res raster (if needed)
+graph export "$output/Figure1_combined.tif", width(4000) replace
+
+
+	
+           ***********************************
+           * binary logit model 2 : robustness
+           ***********************************		
+
+**NOTE: Just run the model and copy coefficients/CIs into a table in Appendix
+
+xtile seifa_quart = seifa_irsd, n(4) // seifa quartiles 
+split patientsitekey, parse("-") // for practice fixed effects: patientsitekey1
+destring patientsitekey1, replace
+	
+logit mm_group_binary ///
+    c.age_baseline ///
+    i.sex ///
+    i.seifa_quart ///
+    i.cardio_max ///
+	i.respiratory_max ///
+	i.cancer_max ///
+	i.disability_max ///
+	i.dementia_alzheim_max ///
+	i.patientsitekey1 /// 
+    c.service_tele_pooled c.service_gp_pooled ///
+    c.presc_total c.referral_number ///
+    i.flag_rcbh, or
+
